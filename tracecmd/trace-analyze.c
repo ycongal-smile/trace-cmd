@@ -264,6 +264,17 @@ static void process_cpu(struct analysis_data *data,
 	update_cpu_times(cpu_data, tep, pid, record);
 }
 
+static int cmp_tasks(const void *A, const void *B)
+{
+	struct task_item * const *a = A;
+	struct task_item * const *b = B;
+
+	if ((*a)->runtime > (*b)->runtime)
+		return -1;
+
+	return (*a)->runtime < (*b)->runtime;
+}
+
 static void print_time(unsigned long long ts, char delim)
 {
 	unsigned long long secs;
@@ -301,8 +312,10 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 	struct trace_hash_item **bucket;
 	struct trace_hash_item *item;
 	struct task_item **idle_tasks;
+	struct task_item **tasks;
 	struct task_item *task;
 	bool first = true;
+	int nr_tasks;
 	int cpu;
 	int i = 0;
 
@@ -310,6 +323,10 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 	printf("\nTotal time: ");
 	print_time(total_time, '_');
 	printf("\n");
+
+	tasks = malloc(sizeof(*tasks) * data->nr_tasks);
+	if (!tasks)
+		die("Could not allocate task array");
 
 	idle_tasks = calloc(sizeof(*idle_tasks), data->allocated_cpus);
 	if (!idle_tasks)
@@ -321,9 +338,13 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 			if (task->pid < 0) {
 				cpu = -2 - task->pid;
 				idle_tasks[cpu] = task;
-			}
+			} else
+				tasks[i++] = task;
 		}
 	}
+	nr_tasks = i;
+
+	qsort(tasks, nr_tasks, sizeof(*tasks), cmp_tasks);
 
 	for (i = 0; i < data->allocated_cpus; i++) {
 		if (!idle_tasks[i])
@@ -339,6 +360,22 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 		printf(" (%%%lld)\n", (idle_tasks[i]->runtime * 100) / total_time);
 	}
 	free(idle_tasks);
+
+	printf("\n");
+	for (i = 0; i < nr_tasks; i++) {
+		if (!i) {
+			printf("    Task name        PID \t     Run time\n");
+			printf("    ---------        --- \t     --------\n");
+		}
+		printf("%16s %8d\t",
+		       tep_data_comm_from_pid(tep, tasks[i]->pid),
+		       tasks[i]->pid);
+		print_time(tasks[i]->runtime, '_');
+		printf(" (%%%lld)\n", (tasks[i]->runtime * 100) / total_time);
+	}
+	free(tasks);
+
+	printf("\n");
 }
 
 static void free_tasks(struct trace_hash *hash)
