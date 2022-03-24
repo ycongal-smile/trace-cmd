@@ -34,6 +34,7 @@ struct analysis_data {
 	unsigned long long	last_ts;
 	struct tep_event	*switch_event;
 	struct tep_event	*wakeup_event;
+	struct tep_event	*page_fault_event;
 	struct tep_format_field	*prev_comm;
 	struct tep_format_field	*prev_state;
 	struct tep_format_field	*next_comm;
@@ -58,6 +59,7 @@ struct task_item {
 	unsigned long long	runtime;
 	unsigned long long	start_ts;
 	unsigned long long	migrated;
+	unsigned long long	faulted;
 	struct sched_timings	preempt;
 	struct sched_timings	sleep;
 	struct sched_timings	blocked;
@@ -449,6 +451,19 @@ static void process_wakeup(struct analysis_data *data,
 	task->woken = true;
 }
 
+static void process_page_fault(struct analysis_data *data,
+			       struct tep_handle *tep, int pid,
+			       struct tep_record *record)
+{
+	struct cpu_data *cpu_data = &data->cpu_data[record->cpu];
+	struct task_cpu_item *cpu_task;
+	struct task_item *task;
+
+	cpu_task = get_cpu_task(cpu_data, pid);
+	task = cpu_task->task;
+	task->faulted++;
+}
+
 static bool match_type(int type, struct tep_event *event)
 {
 	return event && type == event->id;
@@ -475,6 +490,9 @@ static void process_cpu(struct analysis_data *data,
 
 	else if (match_type(type, data->wakeup_event))
 		process_wakeup(data, tep, record);
+
+	else if (match_type(type, data->page_fault_event))
+		process_page_fault(data, tep, pid, record);
 }
 
 static int cmp_tasks(const void *A, const void *B)
@@ -664,7 +682,9 @@ static void print_task(struct tep_handle *tep, struct task_item *task)
 	print_time(task->runtime, '_');
 	printf("\n");
 	if (task->migrated)
-		printf("Migrated:\t%llu\n", task->migrated);
+		printf("Migrated: %8llu\n", task->migrated);
+	if (task->faulted)
+		printf("Faulted:  %8llu\n", task->faulted);
 	print_timings_title("Type");
 	print_sched_timings("Wakeup", &task->wakeup);
 	print_sched_timings("Preempted", &task->preempt);
@@ -821,6 +841,7 @@ static void do_trace_analyze(struct tracecmd_input *handle)
 	data.wakeup_event = tep_find_event_by_name(tep, "sched", "sched_waking");
 	if (!data.wakeup_event)
 		data.wakeup_event = tep_find_event_by_name(tep, "sched", "sched_wakeup");
+	data.page_fault_event = tep_find_event_by_name(tep, "exceptions", "page_fault_user");
 
 	/* Set to a very large number */
 	data.start_ts = -1ULL;
