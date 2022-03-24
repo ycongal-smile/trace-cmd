@@ -44,6 +44,7 @@ struct task_item {
 };
 
 struct task_cpu_item {
+	unsigned long long	runtime;
 	struct trace_hash_item	hash;
 	struct task_item       	*task;
 };
@@ -171,6 +172,7 @@ static void update_cpu_task_times(struct cpu_data *cpu_data,
 
 	delta = ts - task->start_ts;
 	task->runtime += delta;
+	cpu_task->runtime += delta;
 }
 
 static void update_pid(struct cpu_data *cpu_data,
@@ -198,6 +200,7 @@ static void update_pid(struct cpu_data *cpu_data,
 	} else {
 		delta = record->ts - cpu_data->last_ts;
 		task->runtime += delta;
+		cpu_task->runtime += delta;
 	}
 
 	cpu_data->last_ts = record->ts;
@@ -246,6 +249,7 @@ static void update_first_pid(struct cpu_data *cpu_data)
 	task = cpu_task->task;
 	delta = cpu_data->start_ts - start_ts;
 	task->runtime += delta;
+	cpu_task->runtime += delta;
 	cpu_data->start_ts = start_ts;
 }
 
@@ -268,6 +272,17 @@ static int cmp_tasks(const void *A, const void *B)
 {
 	struct task_item * const *a = A;
 	struct task_item * const *b = B;
+
+	if ((*a)->runtime > (*b)->runtime)
+		return -1;
+
+	return (*a)->runtime < (*b)->runtime;
+}
+
+static int cmp_cpu_tasks(const void *A, const void *B)
+{
+	struct task_cpu_item * const *a = A;
+	struct task_cpu_item * const *b = B;
 
 	if ((*a)->runtime > (*b)->runtime)
 		return -1;
@@ -304,6 +319,67 @@ static void print_time(unsigned long long ts, char delim)
 		if (time_in_nsecs)
 			printf("%03llu", nsecs);
 	}
+}
+
+static void print_cpu_data(struct tep_handle *tep, struct cpu_data *cpu_data)
+{
+	unsigned long long total_time;
+	struct trace_hash_item **bucket;
+	struct trace_hash_item *item;
+	struct task_cpu_item **cpu_tasks;
+	struct task_cpu_item *cpu_task;
+	struct task_item *idle_task = NULL;
+	struct task_item *task;
+	struct analysis_data *data;
+	int nr_tasks;
+	int i = 0;
+
+	data = cpu_data->data;
+	total_time = data->last_ts - data->start_ts;
+
+	printf("\nCPU %d\n", cpu_data->cpu);
+	printf("-------\n");
+
+	cpu_tasks = malloc(sizeof(*cpu_tasks) * cpu_data->nr_tasks);
+
+	if (!cpu_tasks)
+		die("Could not allocate task array");
+
+	trace_hash_for_each_bucket(bucket, &cpu_data->tasks) {
+		trace_hash_for_each_item(item, bucket) {
+			cpu_task = task_cpu_from_hash(item);
+			if (cpu_task->task->pid <= 0)
+				idle_task = cpu_task->task;
+			else
+				cpu_tasks[i++] = cpu_task;
+		}
+	}
+	nr_tasks = i;
+
+	if (idle_task) {
+		printf("idle:\t");
+		print_time(idle_task->runtime, '_');
+		printf(" (%%%lld)\n", (idle_task->runtime * 100) / total_time);
+	} else {
+		printf("Never idle!\n");
+	}
+
+	qsort(cpu_tasks, nr_tasks, sizeof(*cpu_tasks), cmp_cpu_tasks);
+
+	for (i = 0; i < nr_tasks; i++) {
+		task = cpu_tasks[i]->task;
+
+		if (!i) {
+			printf("    Task name        PID \t     Run time\n");
+			printf("    ---------        --- \t     --------\n");
+		}
+		printf("%16s %8d\t",
+		       tep_data_comm_from_pid(tep, task->pid),
+		       task->pid);
+		print_time(cpu_tasks[i]->runtime, '_');
+		printf(" (%%%lld)\n", (task->runtime * 100) / total_time);
+	}
+	free(cpu_tasks);
 }
 
 static void print_total(struct tep_handle *tep, struct analysis_data *data)
@@ -376,6 +452,12 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 	free(tasks);
 
 	printf("\n");
+
+	for (i = 0; i < data->allocated_cpus; i++) {
+		if (!data->cpu_data[i].data)
+			continue;
+		print_cpu_data(tep, &data->cpu_data[i]);
+	}
 }
 
 static void free_tasks(struct trace_hash *hash)
