@@ -14,16 +14,19 @@
 static bool time_in_nsecs;
 
 struct analysis_data;
+struct task_item;
 
 struct cpu_data {
 	unsigned long long	start_ts;
 	unsigned long long	last_ts;
+	struct task_item	*idle_task;
 	struct analysis_data	*data;
 	struct trace_hash	tasks;
 	int			nr_tasks;
 	int			cpu;
 	int			current_pid;
 	int			first_pid;
+	bool			last_idle;
 };
 
 struct analysis_data {
@@ -185,6 +188,31 @@ static void update_sched_timings (struct sched_timings *time, unsigned long long
 	time->nr++;
 }
 
+static void update_idle_task(struct cpu_data *cpu_data, struct task_item *task,
+			     unsigned long long ts)
+{
+	if (!cpu_data->idle_task) {
+		if (task && task->pid <= 0) {
+			cpu_data->idle_task = task;
+			task->other.last = ts;
+			cpu_data->last_idle = true;
+		}
+		return;
+	}
+	if (!task || task->pid > 0) {
+		if (cpu_data->last_idle)
+			update_sched_timings(&cpu_data->idle_task->other, ts);
+
+		cpu_data->last_idle = false;
+		return;
+	}
+	if (cpu_data->last_idle)
+		update_sched_timings(&task->other, ts);
+
+	cpu_data->last_idle = true;
+	task->other.last = ts;
+}
+
 /* Update times for a task scheduling off the CPU */
 static void update_cpu_task_times(struct cpu_data *cpu_data,
 				  struct task_cpu_item *cpu_task,
@@ -202,6 +230,8 @@ static void update_cpu_task_times(struct cpu_data *cpu_data,
 	 */
 	if (ts < task->start_ts)
 		return;
+
+	update_idle_task(cpu_data, task, ts);
 
 	delta = ts - task->start_ts;
 	task->runtime += delta;
@@ -226,6 +256,8 @@ static void update_pid(struct cpu_data *cpu_data,
 
 	cpu_task = get_cpu_task(cpu_data, pid);
 	task = cpu_task->task;
+
+	update_idle_task(cpu_data, task, record->ts);
 
 	if (record->ts < cpu_data->last_ts) {
 		tracecmd_warning("task %d start time %llu greater than CPU time %llu",
@@ -258,6 +290,7 @@ static void update_cpu_times(struct cpu_data *cpu_data,
 		cpu_task = get_cpu_task(cpu_data, pid);
 		task = cpu_task->task;
 		task->start_ts = record->ts;
+		update_idle_task(cpu_data, task, record->ts);
 		if (record->ts < cpu_data->data->start_ts)
 			cpu_data->data->start_ts = record->ts;
 		return;
@@ -267,6 +300,8 @@ static void update_cpu_times(struct cpu_data *cpu_data,
 		update_pid(cpu_data, record, pid);
 		return;
 	}
+
+	update_idle_task(cpu_data, !pid ? cpu_data->idle_task : NULL, record->ts);
 
 	cpu_data->last_ts = record->ts;
 }
@@ -283,6 +318,17 @@ static void update_first_pid(struct cpu_data *cpu_data)
 	delta = cpu_data->start_ts - start_ts;
 	task->runtime += delta;
 	cpu_task->runtime += delta;
+
+	/* Handle idle timings if it was the first task */
+	if (task->pid <= 0) {
+		task->other.total += delta;
+		if (delta > task->other.longest) {
+			task->other.longest = delta;
+			task->other.longest_ts = cpu_data->start_ts;
+		}
+		task->other.nr++;
+	}
+
 	cpu_data->start_ts = start_ts;
 }
 
@@ -336,6 +382,8 @@ static void process_switch(struct analysis_data *data,
 		task = cpu_task->task;
 		task->start_ts = record->ts;
 		cpu_data->current_pid = pid;
+
+		update_idle_task(cpu_data, task, record->ts);
 
 		switch (task->last_state) {
 		case -1:
@@ -452,6 +500,27 @@ static void print_time(unsigned long long ts, char delim)
 	}
 }
 
+static void print_timings_title(const char *label)
+{
+	const char *a = "";
+	int len;
+	int i;
+
+	if (time_in_nsecs)
+		a = "   ";
+
+	len = snprintf(NULL, 0, "%s", label);
+
+	printf("%s%*sTotal    %s(cnt)       Avg              Longest       Where\n",
+		label, 21 - len, "", a);
+
+	for (i = 0; i < len; i++)
+		printf("-");
+
+	printf("%*s-----    %s-----       ---              -------       -----\n",
+		21 - len, "", a);
+}
+
 static void print_sched_timings(const char *label, struct sched_timings *time)
 {
 	unsigned long long avg;
@@ -460,7 +529,10 @@ static void print_sched_timings(const char *label, struct sched_timings *time)
 	if (!time->nr)
 		return;
 
-	printf("%s:\t", label);
+	if (label)
+		printf("%s:%*s", label, 15 - (int)strlen(label), "");
+	else
+		printf("\t\t");
 	print_time(time->total, 0);
 	n = printf(" (%llu)", time->nr);
 	if (n < 8)
@@ -519,6 +591,8 @@ static void print_cpu_data(struct tep_handle *tep, struct cpu_data *cpu_data)
 		printf("idle:\t");
 		print_time(idle_task->runtime, '_');
 		printf(" (%%%lld)\n", (idle_task->runtime * 100) / total_time);
+		print_timings_title("Idleness");
+		print_sched_timings(NULL, &idle_task->other);
 	} else {
 		printf("Never idle!\n");
 	}
@@ -543,19 +617,12 @@ static void print_cpu_data(struct tep_handle *tep, struct cpu_data *cpu_data)
 
 static void print_task(struct tep_handle *tep, struct task_item *task)
 {
-	const char *a = "";
-
-	if (time_in_nsecs)
-		a = "   ";
-
 	printf("\nTask: %d : %s:\n",
 	       task->pid , task->comm ? : tep_data_comm_from_pid(tep, task->pid));
 	printf("Runtime: ");
 	print_time(task->runtime, '_');
-	printf("\nType                 Total    %s(cnt)       Avg              Longest       Where\n",
-		a);
-	printf("----                 -----    %s-----       ---              -------       -----\n",
-		a);
+	printf("\n");
+	print_timings_title("Type");
 	print_sched_timings("Preempted", &task->preempt);
 	print_sched_timings("Blocked", &task->blocked);
 	print_sched_timings("Sleeping", &task->sleep);
