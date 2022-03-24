@@ -270,6 +270,8 @@ static void process_switch(struct analysis_data *data,
 	cpu_task = get_cpu_task(cpu_data, pid);
 	task = cpu_task->task;
 
+	update_cpu_task_times(cpu_data, cpu_task, record->ts);
+
 	/* Fill in missing comms */
 	if (pid && data->prev_comm && !task->comm) {
 		comm = (char *)(record->data + data->prev_comm->offset);
@@ -283,6 +285,8 @@ static void process_switch(struct analysis_data *data,
 		pid = val;
 		cpu_task = get_cpu_task(cpu_data, pid);
 		task = cpu_task->task;
+		task->start_ts = record->ts;
+		cpu_data->current_pid = pid;
 
 		/* Fill in missing comms */
 		if (pid && data->next_comm && !task->comm) {
