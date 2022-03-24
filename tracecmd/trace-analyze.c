@@ -19,6 +19,8 @@ struct task_item;
 struct cpu_data {
 	unsigned long long	start_ts;
 	unsigned long long	last_ts;
+	unsigned long long	missed_events;
+	unsigned long long	unknown_missed_events;
 	struct task_item	*idle_task;
 	struct analysis_data	*data;
 	struct trace_hash	tasks;
@@ -27,6 +29,7 @@ struct cpu_data {
 	int			current_pid;
 	int			first_pid;
 	bool			last_idle;
+	bool			keep_start;
 };
 
 struct analysis_data {
@@ -45,6 +48,7 @@ struct analysis_data {
 	int			nr_tasks;
 	int			allocated_cpus;
 	int			cpus;
+	bool			missed_events;
 };
 
 struct sched_timings {
@@ -71,6 +75,7 @@ struct task_item {
 	int			last_cpu;
 	int			last_state;
 	bool			woken;
+	bool			dropped_events;
 };
 
 struct task_cpu_item {
@@ -306,6 +311,9 @@ static void update_cpu_times(struct cpu_data *cpu_data,
 		update_idle_task(cpu_data, task, record->ts);
 		if (record->ts < cpu_data->data->start_ts)
 			cpu_data->data->start_ts = record->ts;
+		/* If we lost events before here, keep the current start time */
+		if (record->missed_events)
+			cpu_data->keep_start = true;
 		return;
 	}
 
@@ -325,6 +333,10 @@ static void update_first_pid(struct cpu_data *cpu_data)
 	struct task_item *task;
 	unsigned long long start_ts = cpu_data->data->start_ts;
 	unsigned long long delta;
+
+	/* If the CPU started with dropped events, do not update */
+	if (cpu_data->keep_start)
+		return;
 
 	cpu_task = get_cpu_task(cpu_data, cpu_data->first_pid);
 	task = cpu_task->task;
@@ -464,6 +476,50 @@ static void process_page_fault(struct analysis_data *data,
 	task->faulted++;
 }
 
+static void handle_missed_events(struct analysis_data *data,
+				 struct tep_record *record)
+{
+	struct trace_hash_item **bucket;
+	struct trace_hash_item *item;
+	struct task_cpu_item *cpu_task;
+	struct cpu_data *cpu_data;
+	struct task_item *task;
+	long long missed_events = record->missed_events;
+	int cpu;
+
+	/* If this is the first event for the CPU do nothing here */
+	if (record->cpu >= data->allocated_cpus ||
+	    !data->cpu_data[record->cpu].data)
+		return;
+
+	data->missed_events = true;
+
+	cpu_data = &data->cpu_data[record->cpu];
+	cpu = cpu_data->cpu;
+
+	if (missed_events > 0)
+		cpu_data->missed_events += missed_events;
+	else
+		cpu_data->unknown_missed_events++;
+
+	/* Need to reset all timings */
+	trace_hash_for_each_bucket(bucket, &cpu_data->tasks) {
+		trace_hash_for_each_item(item, bucket) {
+			cpu_task = task_cpu_from_hash(item);
+			task = cpu_task->task;
+			if (task->last_cpu != cpu)
+				continue;
+			task->preempt.last = record->ts;
+			task->sleep.last = record->ts;
+			task->blocked.last = record->ts;
+			task->other.last = record->ts;
+			task->woken = false;
+			task->last_state = -1;
+			task->dropped_events = true;
+		}
+	}
+}
+
 static bool match_type(int type, struct tep_event *event)
 {
 	return event && type == event->id;
@@ -476,6 +532,9 @@ static void process_cpu(struct analysis_data *data,
 	struct cpu_data *cpu_data;
 	int type;
 	int pid;
+
+	if (record->missed_events)
+		handle_missed_events(data, record);
 
 	pid = tep_data_pid(tep, record);
 	if (pid < 0) /* Warn? */
@@ -624,11 +683,28 @@ static void print_cpu_data(struct tep_handle *tep, struct cpu_data *cpu_data)
 	int nr_tasks;
 	int i = 0;
 
-	data = cpu_data->data;
-	total_time = data->last_ts - data->start_ts;
-
 	printf("\nCPU %d\n", cpu_data->cpu);
 	printf("-------\n");
+
+	if (cpu_data->missed_events || cpu_data->unknown_missed_events) {
+		printf("Missed: %llu events", cpu_data->missed_events);
+		if (cpu_data->unknown_missed_events)
+			printf(" + %llu drops of unknown events",
+			       cpu_data->unknown_missed_events);
+		printf("\n");
+	}
+
+	data = cpu_data->data;
+
+	if (cpu_data->keep_start) {
+		total_time = data->last_ts - cpu_data->start_ts;
+		printf("[ Events dropped before start of this CPU ]\n");
+		printf("Total time: ");
+		print_time(total_time, '_');
+		printf("\n");
+	} else {
+		total_time = data->last_ts - data->start_ts;
+	}
 
 	cpu_tasks = malloc(sizeof(*cpu_tasks) * cpu_data->nr_tasks);
 
@@ -678,6 +754,8 @@ static void print_task(struct tep_handle *tep, struct task_item *task)
 {
 	printf("\nTask: %d : %s:\n",
 	       task->pid , task->comm ? : tep_data_comm_from_pid(tep, task->pid));
+	if (task->dropped_events)
+		printf("[ Events dropped for this task's CPU, may be missing data ]\n");
 	printf("Runtime:    ");
 	print_time(task->runtime, '_');
 	printf("\n");
@@ -705,6 +783,9 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 	int nr_tasks;
 	int cpu;
 	int i = 0;
+
+	if (data->missed_events)
+		printf("\n[ Missed events, some data may be missing ]\n");
 
 	total_time = data->last_ts - data->start_ts;
 	printf("\nTotal time: ");
