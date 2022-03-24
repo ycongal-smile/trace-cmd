@@ -55,6 +55,7 @@ struct sched_timings {
 struct task_item {
 	unsigned long long	runtime;
 	unsigned long long	start_ts;
+	unsigned long long	migrated;
 	struct sched_timings	preempt;
 	struct sched_timings	sleep;
 	struct sched_timings	blocked;
@@ -62,6 +63,7 @@ struct task_item {
 	char			*comm;
 	struct trace_hash_item	hash;
 	int			pid;
+	int			last_cpu;
 	int			last_state;
 };
 
@@ -149,6 +151,7 @@ static struct task_item *get_task(struct cpu_data *cpu_data, int pid)
 		hash->key = find_pid;
 		cpu_data->data->nr_tasks++;
 		trace_hash_add(&cpu_data->data->tasks, hash);
+		task->last_cpu = cpu_data->cpu;
 		task->last_state = -1;
 	}
 
@@ -256,6 +259,10 @@ static void update_pid(struct cpu_data *cpu_data,
 
 	cpu_task = get_cpu_task(cpu_data, pid);
 	task = cpu_task->task;
+	if (task->last_cpu != cpu_data->cpu) {
+		task->last_cpu = cpu_data->cpu;
+		task->migrated++;
+	}
 
 	update_idle_task(cpu_data, task, record->ts);
 
@@ -382,6 +389,11 @@ static void process_switch(struct analysis_data *data,
 		task = cpu_task->task;
 		task->start_ts = record->ts;
 		cpu_data->current_pid = pid;
+
+		if (task->last_cpu != cpu_data->cpu) {
+			task->last_cpu = cpu_data->cpu;
+			task->migrated++;
+		}
 
 		update_idle_task(cpu_data, task, record->ts);
 
@@ -619,9 +631,11 @@ static void print_task(struct tep_handle *tep, struct task_item *task)
 {
 	printf("\nTask: %d : %s:\n",
 	       task->pid , task->comm ? : tep_data_comm_from_pid(tep, task->pid));
-	printf("Runtime: ");
+	printf("Runtime:    ");
 	print_time(task->runtime, '_');
 	printf("\n");
+	if (task->migrated)
+		printf("Migrated:\t%llu\n", task->migrated);
 	print_timings_title("Type");
 	print_sched_timings("Preempted", &task->preempt);
 	print_sched_timings("Blocked", &task->blocked);
