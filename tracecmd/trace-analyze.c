@@ -33,10 +33,12 @@ struct analysis_data {
 	unsigned long long	start_ts;
 	unsigned long long	last_ts;
 	struct tep_event	*switch_event;
+	struct tep_event	*wakeup_event;
 	struct tep_format_field	*prev_comm;
 	struct tep_format_field	*prev_state;
 	struct tep_format_field	*next_comm;
 	struct tep_format_field	*next_pid;
+	struct tep_format_field	*wakeup_pid;
 	struct cpu_data		*cpu_data;
 	struct trace_hash	tasks;
 	int			nr_tasks;
@@ -60,11 +62,13 @@ struct task_item {
 	struct sched_timings	sleep;
 	struct sched_timings	blocked;
 	struct sched_timings	other;
+	struct sched_timings	wakeup;
 	char			*comm;
 	struct trace_hash_item	hash;
 	int			pid;
 	int			last_cpu;
 	int			last_state;
+	bool			woken;
 };
 
 struct task_cpu_item {
@@ -420,7 +424,29 @@ static void process_switch(struct analysis_data *data,
 			comm = (char *)(record->data + data->next_comm->offset);
 			task->comm = strdup(comm);
 		}
+
+		if (task->woken)
+			update_sched_timings(&task->wakeup, record->ts);
+		task->woken = false;
 	}
+}
+
+static void process_wakeup(struct analysis_data *data,
+			   struct tep_handle *tep,
+			   struct tep_record *record)
+{
+	struct cpu_data *cpu_data = &data->cpu_data[record->cpu];
+	struct task_cpu_item *cpu_task;
+	struct task_item *task;
+	unsigned long long val;
+	int pid;
+
+	tep_read_number_field(data->wakeup_pid, record->data, &val);
+	pid = val;
+	cpu_task = get_cpu_task(cpu_data, pid);
+	task = cpu_task->task;
+	task->wakeup.last = record->ts;
+	task->woken = true;
 }
 
 static bool match_type(int type, struct tep_event *event)
@@ -446,6 +472,9 @@ static void process_cpu(struct analysis_data *data,
 	type = tep_data_type(tep, record);
 	if (match_type(type, data->switch_event))
 		process_switch(data, tep, pid, record);
+
+	else if (match_type(type, data->wakeup_event))
+		process_wakeup(data, tep, record);
 }
 
 static int cmp_tasks(const void *A, const void *B)
@@ -637,6 +666,7 @@ static void print_task(struct tep_handle *tep, struct task_item *task)
 	if (task->migrated)
 		printf("Migrated:\t%llu\n", task->migrated);
 	print_timings_title("Type");
+	print_sched_timings("Wakeup", &task->wakeup);
 	print_sched_timings("Preempted", &task->preempt);
 	print_sched_timings("Blocked", &task->blocked);
 	print_sched_timings("Sleeping", &task->sleep);
@@ -788,6 +818,9 @@ static void do_trace_analyze(struct tracecmd_input *handle)
 	trace_hash_init(&data.tasks, 128);
 
 	data.switch_event = tep_find_event_by_name(tep, "sched", "sched_switch");
+	data.wakeup_event = tep_find_event_by_name(tep, "sched", "sched_waking");
+	if (!data.wakeup_event)
+		data.wakeup_event = tep_find_event_by_name(tep, "sched", "sched_wakeup");
 
 	/* Set to a very large number */
 	data.start_ts = -1ULL;
@@ -797,6 +830,12 @@ static void do_trace_analyze(struct tracecmd_input *handle)
 		data.next_comm = tep_find_field(data.switch_event, "next_comm");
 		data.prev_comm = tep_find_field(data.switch_event, "prev_comm");
 		data.prev_state = tep_find_field(data.switch_event, "prev_state");
+	}
+
+	if (data.wakeup_event) {
+		data.wakeup_pid = tep_find_field(data.wakeup_event, "pid");
+		if (!data.wakeup_pid)
+			data.wakeup_event = NULL;
 	}
 
 	do {
