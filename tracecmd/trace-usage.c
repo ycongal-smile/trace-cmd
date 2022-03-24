@@ -279,6 +279,13 @@ static struct usage_help usage_help[] = {
 		"          --verbose 'level' Set the desired log level\n"
 	},
 	{
+		"analyze",
+		"Analyze a trace file and extract various information about it",
+		" %s analyze [-i input][-t]\n"
+		"    -i Specify the input file to read, otherwise read the first non option\n"
+		"    -t Show time stamps in nanoseconds instead of microseconds\n"
+	},
+	{
 		"hist",
 		"show a histogram of the trace.dat information",
 		" %s hist [-i file][-P] [file]"
