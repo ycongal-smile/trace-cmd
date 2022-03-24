@@ -29,6 +29,10 @@ struct cpu_data {
 struct analysis_data {
 	unsigned long long	start_ts;
 	unsigned long long	last_ts;
+	struct tep_event	*switch_event;
+	struct tep_format_field	*prev_comm;
+	struct tep_format_field	*next_comm;
+	struct tep_format_field	*next_pid;
 	struct cpu_data		*cpu_data;
 	struct trace_hash	tasks;
 	int			nr_tasks;
@@ -39,6 +43,7 @@ struct analysis_data {
 struct task_item {
 	unsigned long long	runtime;
 	unsigned long long	start_ts;
+	char			*comm;
 	struct trace_hash_item	hash;
 	int			pid;
 };
@@ -253,11 +258,51 @@ static void update_first_pid(struct cpu_data *cpu_data)
 	cpu_data->start_ts = start_ts;
 }
 
+static void process_switch(struct analysis_data *data,
+			   struct tep_handle *tep, int pid,
+			   struct tep_record *record)
+{
+	struct cpu_data *cpu_data = &data->cpu_data[record->cpu];
+	struct task_cpu_item *cpu_task;
+	struct task_item *task;
+	const char *comm;
+
+	cpu_task = get_cpu_task(cpu_data, pid);
+	task = cpu_task->task;
+
+	/* Fill in missing comms */
+	if (pid && data->prev_comm && !task->comm) {
+		comm = (char *)(record->data + data->prev_comm->offset);
+		task->comm = strdup(comm);
+	}
+
+	if (data->next_pid) {
+		unsigned long long val;
+
+		tep_read_number_field(data->next_pid, record->data, &val);
+		pid = val;
+		cpu_task = get_cpu_task(cpu_data, pid);
+		task = cpu_task->task;
+
+		/* Fill in missing comms */
+		if (pid && data->next_comm && !task->comm) {
+			comm = (char *)(record->data + data->next_comm->offset);
+			task->comm = strdup(comm);
+		}
+	}
+}
+
+static bool match_type(int type, struct tep_event *event)
+{
+	return event && type == event->id;
+}
+
 static void process_cpu(struct analysis_data *data,
 			struct tep_handle *tep,
 			struct tep_record *record)
 {
 	struct cpu_data *cpu_data;
+	int type;
 	int pid;
 
 	pid = tep_data_pid(tep, record);
@@ -266,6 +311,10 @@ static void process_cpu(struct analysis_data *data,
 
 	cpu_data = get_cpu_data(data, record);
 	update_cpu_times(cpu_data, tep, pid, record);
+
+	type = tep_data_type(tep, record);
+	if (match_type(type, data->switch_event))
+		process_switch(data, tep, pid, record);
 }
 
 static int cmp_tasks(const void *A, const void *B)
@@ -374,7 +423,7 @@ static void print_cpu_data(struct tep_handle *tep, struct cpu_data *cpu_data)
 			printf("    ---------        --- \t     --------\n");
 		}
 		printf("%16s %8d\t",
-		       tep_data_comm_from_pid(tep, task->pid),
+		       task->comm ? : tep_data_comm_from_pid(tep, task->pid),
 		       task->pid);
 		print_time(cpu_tasks[i]->runtime, '_');
 		printf(" (%%%lld)\n", (task->runtime * 100) / total_time);
@@ -444,7 +493,7 @@ static void print_total(struct tep_handle *tep, struct analysis_data *data)
 			printf("    ---------        --- \t     --------\n");
 		}
 		printf("%16s %8d\t",
-		       tep_data_comm_from_pid(tep, tasks[i]->pid),
+		       tasks[i]->comm ? : tep_data_comm_from_pid(tep, tasks[i]->pid),
 		       tasks[i]->pid);
 		print_time(tasks[i]->runtime, '_');
 		printf(" (%%%lld)\n", (tasks[i]->runtime * 100) / total_time);
@@ -470,6 +519,7 @@ static void free_tasks(struct trace_hash *hash)
 		trace_hash_while_item(item, bucket) {
 			task = task_from_hash(item);
 			trace_hash_del(item);
+			free(task->comm);
 			free(task);
 		}
 	}
@@ -518,8 +568,16 @@ static void do_trace_analyze(struct tracecmd_input *handle)
 
 	trace_hash_init(&data.tasks, 128);
 
+	data.switch_event = tep_find_event_by_name(tep, "sched", "sched_switch");
+
 	/* Set to a very large number */
 	data.start_ts = -1ULL;
+
+	if (data.switch_event) {
+		data.next_pid = tep_find_field(data.switch_event, "next_pid");
+		data.next_comm = tep_find_field(data.switch_event, "next_comm");
+		data.prev_comm = tep_find_field(data.switch_event, "prev_comm");
+	}
 
 	do {
 		record = tracecmd_read_next_data(handle, NULL);
