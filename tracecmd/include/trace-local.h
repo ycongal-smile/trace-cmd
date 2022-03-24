@@ -119,6 +119,8 @@ void trace_dump(int argc, char **argv);
 
 void trace_convert(int argc, char **argv);
 
+void trace_analyze(int argc, char **argv);
+
 int trace_record_agent(struct tracecmd_msg_handle *msg_handle,
 		       int cpus, int *fds,
 		       int argc, char **argv,

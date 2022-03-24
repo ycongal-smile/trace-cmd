@@ -150,6 +150,7 @@ struct command commands[] = {
 	{"help", trace_usage},
 	{"dump", trace_dump},
 	{"convert", trace_convert},
+	{"analyze", trace_analyze},
 	{"-h", trace_usage},
 };
 
